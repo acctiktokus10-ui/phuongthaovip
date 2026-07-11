@@ -1,6 +1,5 @@
 // pages/api/data/[type].js
 import { syncToHoanVi } from '../../../lib/syncToHoanVi'
-import { waitUntil } from '@vercel/functions'
 
 export const config = {
   maxDuration: 30,
@@ -89,9 +88,11 @@ export default async function handler(req, res) {
 
     await kvSet('meta_danhan', { updated_at: new Date().toISOString(), count: Object.keys(data).length })
 
-    waitUntil(syncToHoanVi('danhan', data))
+    // Chờ đồng bộ xong thay vì chạy nền (waitUntil không đảm bảo chạy hết trên
+    // Pages Router / khi Fluid Compute chưa bật) — để biết chắc có sang hoan-vi-web hay không.
+    const syncedToHoanVi = await syncToHoanVi('danhan', data)
 
-    return res.status(200).json({ success: true })
+    return res.status(200).json({ success: true, syncedToHoanVi })
   }
 
   return res.status(405).json({ error: 'Method not allowed' })
