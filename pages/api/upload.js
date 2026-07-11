@@ -1,8 +1,10 @@
 // pages/api/upload.js
 import { syncToHoanVi } from '../../lib/syncToHoanVi'
+import { waitUntil } from '@vercel/functions'
 
 export const config = {
   api: { bodyParser: { sizeLimit: '10mb' } },
+  maxDuration: 30,
 }
 
 const PASSWORD = process.env.UPLOAD_PASSWORD || 'phuongthaovip9999'
@@ -12,8 +14,6 @@ let _store = {}
 async function kvSet(key, value) {
   if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
     const url = `${process.env.UPSTASH_REDIS_REST_URL}/set/${encodeURIComponent(key)}`
-    // Luôn serialize value thành string trước khi lưu vào Redis
-    // Đảm bảo nhất quán: lưu string → đọc về string → parse ra object
     const valueStr = typeof value === 'string' ? value : JSON.stringify(value)
     const res = await fetch(url, {
       method: 'POST',
@@ -58,17 +58,13 @@ export default async function handler(req, res) {
   const ok = await kvSet(key, data)
   if (!ok) return res.status(500).json({ error: 'Lưu dữ liệu thất bại' })
 
-  // Lưu metadata
   await kvSet(`meta_${type}`, { updated_at: now, count })
 
-  // [MỚI] Đồng thời gửi dữ liệu vừa upload sang hoan-vi-web để web hiển thị
-  // đơn hàng/ví tiền cho khách. Không chờ lâu / không làm hỏng response nếu lỗi.
-  const synced = await syncToHoanVi(type, data)
+  waitUntil(syncToHoanVi(type, data))
 
   return res.status(200).json({
     success: true,
     message: `Đã cập nhật ${count} sub_id vào ${key}`,
     updated_at: now,
-    synced_to_hoanvi: synced,
   })
 }
