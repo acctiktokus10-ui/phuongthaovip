@@ -7,7 +7,12 @@ da_nhan_by_subid.json vẫn đọc/ghi local như cũ — không đổi.
 [MỚI] push_danhan_remote(): sau khi bot ghi da_nhan cục bộ (ví dụ sau
 lệnh #ruttien), gọi hàm này để đẩy dữ liệu da_nhan mới nhất lên CẢ HAI web:
   1. phuongthaovip (Vercel + Upstash Redis) — qua POST /api/data/danhan
-  2. hoan-vi-web   (Vercel + Supabase)       — qua POST /api/sync-data
+  2. hoan-vi-web   (Vercel + Upstash Redis, dùng CHUNG database với
+                     phuongthaovip) — qua POST /api/sync-data
+Hai web giờ đọc/ghi chung 1 Upstash Redis nên 2 lần gửi bên dưới thực chất
+ghi đè cùng 1 key `danhan_by_subid` — không sai, chỉ hơi dư, không cần xoá
+vì vẫn hoạt động đúng và giữ nguyên cơ chế xác thực riêng của từng web
+(BOT_SECRET / SYNC_SECRET). Có thể bỏ bớt 1 trong 2 lần gửi nếu muốn gọn hơn.
 Hai lần gửi độc lập nhau: một bên lỗi không ảnh hưởng bên còn lại.
 ──────────────────────────────────────────────────────────────────
 """
@@ -16,6 +21,7 @@ import json
 import logging
 import urllib.request
 import urllib.error
+import urllib.parse
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +36,18 @@ HOANVI_BASE_URL = "https://hoan-vi-web.vercel.app"
 # với biến môi trường BOT_SECRET trên phuongthaovip và SYNC_SECRET trên hoan-vi-web).
 BOT_SECRET = ""    # để trống nếu phuongthaovip không đặt BOT_SECRET
 SYNC_SECRET = "meozzcutemeozzcutemeozzcutemeozzcutemeozzcutemeozzcutemeozzcutemeozzcutemeozzcutemeozzcute9999"
+
+# ── Upstash Redis REST API ─────────────────────────────────────
+# [MỚI] Lấy từ Upstash Console > database "phuongthaovip" > Connect > REST.
+# QUAN TRỌNG: đây là database Redis DÙNG CHUNG giữa phuongthaovip và
+# hoan-vi-web (xem ghi chú đầu file) — nên bot chỉ cần ghi 1 LẦN DUY NHẤT
+# vào đây là cả 2 web đều tự đọc thấy dữ liệu mới, không cần gọi thêm
+# /api/sync-data hay /api/data/danhan qua HTTP của từng web nữa.
+# ⚠️ Token này có toàn quyền đọc/ghi Redis — giữ kín file này, không commit
+# lên Git/public repo. Khuyến khích chuyển sang biến môi trường khi triển khai
+# thật (os.environ.get("UPSTASH_REDIS_REST_URL") ...).
+UPSTASH_REDIS_REST_URL = "https://tops-gobbler-128552.upstash.io"
+UPSTASH_REDIS_REST_TOKEN = "gQAAAAAAfYoAAIgcDJkMmNlZGJmMGU0MWE0ZWZiOThiMTU2N2Q3Yzg5MzA2Mw"
 # ────────────────────────────────────────────────────────────────
 
 _CACHE: dict = {}
@@ -107,7 +125,8 @@ def push_danhan_remote(data: dict) -> dict:
     except Exception as e:
         log.warning(f"⚠️ Đẩy da_nhan lên phuongthaovip thất bại: {e}")
 
-    # 2) hoan-vi-web — POST /api/sync-data
+    # 2) hoan-vi-web — POST /api/sync-data (giờ ghi vào cùng Upstash Redis
+    #    với phuongthaovip, xem ghi chú ở đầu file)
     try:
         headers = {"X-Sync-Secret": SYNC_SECRET} if SYNC_SECRET else {}
         result["hoanvi"] = _post_json(
@@ -120,3 +139,97 @@ def push_danhan_remote(data: dict) -> dict:
         log.warning(f"⚠️ Đẩy da_nhan lên hoan-vi-web thất bại: {e}")
 
     return result
+
+
+def push_danhan_from_file(file_path: str = "da_nhan_by_subid.json") -> dict:
+    """[MỚI] Đọc TOÀN BỘ nội dung file da_nhan_by_subid.json từ đĩa,
+    rồi gọi push_danhan_remote() để đẩy đúng dữ liệu đã ghi lên web.
+
+    Dùng hàm này thay vì truyền thẳng dict trong RAM cho push_danhan_remote(),
+    để đảm bảo dữ liệu gửi đi luôn khớp 100% với những gì đã thực sự nằm
+    trên đĩa (file da_nhan_by_subid.json), tránh lệch dữ liệu nếu có tiến
+    trình khác cũng ghi vào file này.
+
+    Trả về {"phuongthaovip": bool, "hoanvi": bool}, giống push_danhan_remote().
+    Nếu đọc file lỗi (không tồn tại / hỏng định dạng), trả về cả hai False
+    và không gửi gì lên web.
+    """
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        log.warning(f"⚠️ Không tìm thấy {file_path} — bỏ qua đồng bộ da_nhan.")
+        return {"phuongthaovip": False, "hoanvi": False}
+    except Exception as e:
+        log.error(f"❌ Lỗi đọc {file_path} để đồng bộ da_nhan: {e}")
+        return {"phuongthaovip": False, "hoanvi": False}
+
+    return push_danhan_remote(data)
+
+
+def _upstash_kv_set(key: str, value) -> bool:
+    """Ghi 1 key vào Upstash Redis REST API — viết giống HỆT hàm kvSet()
+    trong lib/botData.js (hoan-vi-web) và pages/api/data/[type].js
+    (phuongthaovip): giá trị được json.dumps 1 lần thành chuỗi, rồi chuỗi
+    đó được json.dumps lần nữa để làm body gửi đi (double-encode), để khi
+    web đọc lại bằng kvGet() (parse JSON 1 lần) ra đúng chuỗi JSON gốc,
+    và code hiện tại của web tự parse tiếp lần 2 nếu cần."""
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        log.error("❌ Thiếu UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN — không thể ghi Upstash.")
+        return False
+    value_str = json.dumps(value, ensure_ascii=False)
+    body = json.dumps(value_str).encode("utf-8")
+    url = f"{UPSTASH_REDIS_REST_URL}/set/{urllib.parse.quote(key, safe='')}"
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return 200 <= resp.status < 300
+    except Exception as e:
+        log.error(f"❌ Ghi Upstash key='{key}' thất bại: {e}")
+        return False
+
+
+def push_danhan_to_upstash(data: dict) -> bool:
+    """[MỚI] Ghi thẳng da_nhan_by_subid lên Upstash Redis (REST API).
+    Vì phuongthaovip và hoan-vi-web dùng CHUNG 1 database Upstash, chỉ cần
+    ghi 1 lần duy nhất ở đây là cả 2 web đều tự đọc thấy dữ liệu mới ngay,
+    không cần gọi thêm HTTP request nào sang từng web nữa.
+
+    Trả về True/False. Không raise.
+    """
+    from datetime import datetime as _dt
+    ok = _upstash_kv_set("danhan_by_subid", data)
+    if ok:
+        _upstash_kv_set("meta_danhan", {
+            "updated_at": _dt.utcnow().isoformat(),
+            "count": len(data),
+        })
+        log.info(f"📤 Đã ghi thẳng danhan_by_subid lên Upstash ({len(data)} sub_id)")
+    else:
+        log.error("❌ Ghi danhan_by_subid lên Upstash thất bại")
+    return ok
+
+
+def push_danhan_from_file_to_upstash(file_path: str = "da_nhan_by_subid.json") -> bool:
+    """Đọc TOÀN BỘ nội dung file da_nhan_by_subid.json từ đĩa, rồi ghi
+    thẳng lên Upstash Redis (thay vì gọi HTTP sang web như push_danhan_from_file).
+    """
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        log.warning(f"⚠️ Không tìm thấy {file_path} — bỏ qua đồng bộ Upstash.")
+        return False
+    except Exception as e:
+        log.error(f"❌ Lỗi đọc {file_path} để đồng bộ Upstash: {e}")
+        return False
+
+    return push_danhan_to_upstash(data)
