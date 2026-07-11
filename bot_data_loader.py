@@ -47,7 +47,7 @@ SYNC_SECRET = "meozzcutemeozzcutemeozzcutemeozzcutemeozzcutemeozzcutemeozzcuteme
 # lên Git/public repo. Khuyến khích chuyển sang biến môi trường khi triển khai
 # thật (os.environ.get("UPSTASH_REDIS_REST_URL") ...).
 UPSTASH_REDIS_REST_URL = "https://tops-gobbler-128552.upstash.io"
-UPSTASH_REDIS_REST_TOKEN = "gQAAAAAAfYoAAIgcDJkMmNlZGJmMGU0MWE0ZWZiOThiMTU2N2Q3Yzg5MzA2Mw"
+UPSTASH_REDIS_REST_TOKEN = "gQAAAAAAAfYoAAIgcDJkMmNlZGJmMGU0MWE0ZWZiOThiMTU2N2Q3Yzg5MzA2Mw"
 # ────────────────────────────────────────────────────────────────
 
 _CACHE: dict = {}
@@ -167,34 +167,62 @@ def push_danhan_from_file(file_path: str = "da_nhan_by_subid.json") -> dict:
     return push_danhan_remote(data)
 
 
-def _upstash_kv_set(key: str, value) -> bool:
+def _upstash_kv_set(key: str, value, max_retries: int = 3) -> bool:
     """Ghi 1 key vào Upstash Redis REST API — viết giống HỆT hàm kvSet()
     trong lib/botData.js (hoan-vi-web) và pages/api/data/[type].js
     (phuongthaovip): giá trị được json.dumps 1 lần thành chuỗi, rồi chuỗi
     đó được json.dumps lần nữa để làm body gửi đi (double-encode), để khi
     web đọc lại bằng kvGet() (parse JSON 1 lần) ra đúng chuỗi JSON gốc,
-    và code hiện tại của web tự parse tiếp lần 2 nếu cần."""
+    và code hiện tại của web tự parse tiếp lần 2 nếu cần.
+
+    [MỚI] Tự động thử lại tối đa max_retries lần nếu gặp lỗi kết nối tạm
+    thời (ví dụ WinError 10054 — remote host đóng kết nối đột ngột), để
+    tránh báo lỗi oan khi chỉ là trục trặc mạng thoáng qua.
+    """
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
         log.error("❌ Thiếu UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN — không thể ghi Upstash.")
         return False
     value_str = json.dumps(value, ensure_ascii=False)
     body = json.dumps(value_str).encode("utf-8")
     url = f"{UPSTASH_REDIS_REST_URL}/set/{urllib.parse.quote(key, safe='')}"
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={
-            "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return 200 <= resp.status < 300
-    except Exception as e:
-        log.error(f"❌ Ghi Upstash key='{key}' thất bại: {e}")
-        return False
+
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}",
+                "Content-Type": "application/json",
+                "Connection": "close",  # tránh tái sử dụng kết nối cũ có thể đã bị phía server đóng
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if 200 <= resp.status < 300:
+                    return True
+                body_text = resp.read().decode("utf-8", errors="replace")
+                log.error(f"❌ Ghi Upstash key='{key}' — HTTP {resp.status}: {body_text}")
+                return False
+        except urllib.error.HTTPError as e:
+            # Upstash trả lỗi rõ ràng (vd 401 token sai) — không cần thử lại, sai là sai
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                err_body = ""
+            log.error(f"❌ Ghi Upstash key='{key}' thất bại: HTTP {e.code} {err_body}")
+            return False
+        except Exception as e:
+            last_err = e
+            if attempt < max_retries:
+                log.warning(f"⚠️ Ghi Upstash key='{key}' lỗi tạm thời (lần {attempt}/{max_retries}): {e} — thử lại...")
+                import time as _time
+                _time.sleep(1.5 * attempt)  # chờ tăng dần: 1.5s, 3s, ...
+            else:
+                log.error(f"❌ Ghi Upstash key='{key}' thất bại sau {max_retries} lần thử: {e}")
+
+    return False
 
 
 def push_danhan_to_upstash(data: dict) -> bool:
