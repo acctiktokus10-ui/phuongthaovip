@@ -1,6 +1,5 @@
 // pages/api/upload.js
 import { syncToHoanVi } from '../../lib/syncToHoanVi'
-import { waitUntil } from '@vercel/functions'
 
 export const config = {
   api: { bodyParser: { sizeLimit: '10mb' } },
@@ -60,11 +59,14 @@ export default async function handler(req, res) {
 
   await kvSet(`meta_${type}`, { updated_at: now, count })
 
-  waitUntil(syncToHoanVi(type, data))
+  // Chờ đồng bộ xong thay vì chạy nền (waitUntil không đảm bảo chạy hết trên
+  // Pages Router / khi Fluid Compute chưa bật) — để biết chắc có sang hoan-vi-web hay không.
+  const syncedToHoanVi = await syncToHoanVi(type, data)
 
   return res.status(200).json({
     success: true,
     message: `Đã cập nhật ${count} sub_id vào ${key}`,
     updated_at: now,
+    syncedToHoanVi,
   })
 }
