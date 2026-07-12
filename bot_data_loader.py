@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 VERCEL_BASE_URL = "https://phuongthaovip.vercel.app"
 
 # Web hiển thị cho khách (hoan-vi-web) — nhận đồng bộ donhang/vitien/da_nhan
-HOANVI_BASE_URL = "https://hoan-vi-web.vercel.app"
+HOANVI_BASE_URL = "https://hoantien-phuongthao.vercel.app"
 
 # Secret dùng để xác thực khi bot/phuongthaovip ghi dữ liệu lên (phải khớp
 # với biến môi trường BOT_SECRET trên phuongthaovip và SYNC_SECRET trên hoan-vi-web).
